@@ -15,8 +15,8 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return res.json();
 }
 
-export function fetchOrders(): Promise<Paginated<Order>> {
-  return request("/orders");
+export function fetchOrders(page = 1, signal?: AbortSignal): Promise<Paginated<Order>> {
+  return request(`/orders?page=${page}`, { signal });
 }
 
 export function fetchCustomers(): Promise<{ data: Customer[] }> {
