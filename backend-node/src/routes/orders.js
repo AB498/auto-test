@@ -1,7 +1,7 @@
 import { Router } from "express";
-import { Op } from "sequelize";
+import { col, fn, Op } from "sequelize";
 import { isPositiveInt, validator } from "../http/validate.js";
-import { Customer, Order, ORDER_STATUSES, Product } from "../models/index.js";
+import { Customer, Order, ORDER_STATUSES, OrderItem, Product } from "../models/index.js";
 import { orderResource } from "../serializers/orderResource.js";
 import { placeOrder } from "../services/placeOrder.js";
 import { paginated } from "./paginate.js";
@@ -18,25 +18,52 @@ ordersRouter.get("/", async (req, res) => {
   v.check("search", !search || String(search).length <= 100, "The search field must not be greater than 100 characters.");
   v.passOrThrow();
 
-  let where = {};
-  if (status) where.status = status;
+  // Status and search must compose (AND), not overwrite each other.
+  const conditions = [];
+  if (status) conditions.push({ status });
 
   if (search) {
     const customers = await Customer.findAll({ attributes: ["id"], where: { name: { [Op.like]: `%${search}%` } } });
 
-    where = {
+    conditions.push({
       [Op.or]: [{ reference: { [Op.like]: `%${search}%` } }, { customerId: customers.map((c) => c.id) }],
-    };
+    });
   }
+
+  const where = conditions.length > 0 ? { [Op.and]: conditions } : {};
 
   const { rows, count } = await Order.findAndCountAll({
     where,
     order: [["placedAt", "DESC"]],
     limit: perPage,
     offset: (page - 1) * perPage,
+    distinct: true,
+    include: [{ association: "customer" }, { association: "items", include: [{ association: "product" }] }],
   });
 
-  const data = await Promise.all(rows.map(orderResource));
+  // Per-page aggregates for the two derived counts the serializer reports.
+  // Grouped queries keyed by parent id: one per aggregate, regardless of page size.
+  const itemCounts = new Map();
+  const lifetimeOrders = new Map();
+  if (rows.length > 0) {
+    const itemSums = await OrderItem.findAll({
+      attributes: ["orderId", [fn("SUM", col("quantity")), "quantitySum"]],
+      where: { orderId: rows.map((row) => row.id) },
+      group: ["orderId"],
+      raw: true,
+    });
+    for (const { orderId, quantitySum } of itemSums) itemCounts.set(orderId, Number(quantitySum));
+
+    const orderCounts = await Order.findAll({
+      attributes: ["customerId", [fn("COUNT", col("id")), "orderCount"]],
+      where: { customerId: [...new Set(rows.map((row) => row.customerId))] },
+      group: ["customerId"],
+      raw: true,
+    });
+    for (const { customerId, orderCount } of orderCounts) lifetimeOrders.set(customerId, Number(orderCount));
+  }
+
+  const data = await Promise.all(rows.map((order) => orderResource(order, { itemCounts, lifetimeOrders })));
 
   res.json(paginated(req, data, { page, perPage, total: count }));
 });
